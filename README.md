@@ -1,6 +1,6 @@
-# Claude OpenAI API
+# Claude OpenAI API Bridge
 
-An OpenAI-compatible API server that uses Claude via command-line subprocess. This allows you to use Claude with any application that supports the OpenAI API format.
+An OpenAI-compatible API server that uses Claude via command-line subprocess. This allows you to use Claude with any application that supports the OpenAI API format, with built-in security restrictions for safe operation.
 
 ## Features
 
@@ -14,6 +14,7 @@ An OpenAI-compatible API server that uses Claude via command-line subprocess. Th
 ### Advanced Features
 - **Function calling (tools)** - Complete OpenAI-style function definitions
 - **Conversation history** - Session-based conversations with persistent memory
+- **Response API** - OpenAI Response API format support (`/v1/responses`)
 - **JSON response mode** - Force responses in valid JSON format
 - **Stop sequences** - Custom stop words/phrases
 - **Multiple completions** - Generate up to 10 completions per request (n parameter)
@@ -22,35 +23,74 @@ An OpenAI-compatible API server that uses Claude via command-line subprocess. Th
 - **Seed parameter** - For reproducible outputs
 - **Comprehensive error handling** - Robust retry logic and proper HTTP status codes
 
+### Security Features
+- **Web-only mode** - Restrict Claude to only web tools (WebSearch, WebFetch, WebView)
+- **Tool access control** - Configure allowed/disallowed tools
+- **File system protection** - Block all file system access by default
+- **Configurable restrictions** - Fine-tune security settings via environment variables
+
 ## Prerequisites
 
-- Claude CLI must be installed and available in your PATH
-- You can verify by running: `claude --version`
+- Python 3.11+
+- Docker and Docker Compose (for containerized deployment)
+- Claude CLI (for local installation)
 
-## Setup
+## Quick Start with Docker
 
-1. Install dependencies:
+```bash
+# Clone the repository
+git clone https://github.com/ayush3298/claude-openai-bridge.git
+cd claude-openai-bridge
+
+# Run with Docker (recommended)
+make run
+
+# Or using docker-compose directly
+docker-compose up -d
+```
+
+The API will be available at `http://localhost:8000`
+
+## Installation Options
+
+### Option 1: Docker (Recommended)
+
+```bash
+# Basic usage (web-only mode for security)
+docker-compose up -d
+
+# Development mode with hot reload
+docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+# Production mode with Nginx reverse proxy
+docker-compose --profile production up -d
+
+# With Redis for distributed sessions
+docker-compose --profile redis up -d
+```
+
+### Option 2: Local Installation
+
+1. Install Claude CLI and verify:
+```bash
+claude --version
+```
+
+2. Install Python dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Create a `.env` file (optional, for port configuration):
+3. Configure environment (optional):
 ```bash
 cp .env.example .env
+# Edit .env with your settings
 ```
 
-## Running the Server
-
+4. Run the server:
 ```bash
 python main.py
 ```
-
-Or with uvicorn directly:
-```bash
-uvicorn main:app --reload --port 8000
-```
-
-The server will start on `http://localhost:8000`
 
 ## API Endpoints
 
@@ -59,6 +99,8 @@ The server will start on `http://localhost:8000`
 - `GET /health` - Health check and system status
 - `GET /v1/models` - List available models
 - `POST /v1/chat/completions` - Create chat completion (OpenAI-compatible)
+- `POST /v1/responses` - Create response (OpenAI Response API format)
+- `GET /v1/security` - View current security configuration
 
 ### Session Management Endpoints
 - `POST /v1/sessions` - Create a new conversation session
@@ -66,6 +108,11 @@ The server will start on `http://localhost:8000`
 - `GET /v1/sessions/{session_id}` - Get session details and history
 - `DELETE /v1/sessions/{session_id}` - Delete a session
 - `POST /v1/sessions/{session_id}/clear` - Clear session history
+
+### Response Management Endpoints
+- `GET /v1/responses/{response_id}` - Retrieve stored response
+- `GET /v1/responses` - List all stored responses
+- `DELETE /v1/responses/{response_id}` - Delete stored response
 
 ## Usage Examples
 
@@ -146,9 +193,35 @@ FastAPI automatically generates interactive API documentation:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
 
-## Environment Variables
+## Configuration
 
-- `PORT` - Server port (default: 8000)
+### Environment Variables
+
+```bash
+# Server Configuration
+PORT=8000                    # API server port
+HOST=0.0.0.0                # API server host
+DEBUG=false                  # Enable debug mode
+
+# Claude CLI Configuration
+CLAUDE_COMMAND=claude        # Path to Claude CLI
+REQUEST_TIMEOUT=60          # Request timeout in seconds
+MAX_RETRIES=3               # Maximum retry attempts
+
+# History Management
+ENABLE_HISTORY=true         # Enable conversation history
+HISTORY_STORAGE=memory      # Storage type: memory, file
+HISTORY_DIR=./conversations # Directory for file storage
+MAX_HISTORY_MESSAGES=100    # Max messages per session
+HISTORY_TTL_HOURS=24        # History expiration time
+
+# Security Configuration
+RESTRICTED_MODE=true        # Enable restricted mode
+ALLOWED_TOOLS=WebSearch,WebFetch,WebView  # Allowed tools
+DISALLOWED_TOOLS=Bash,Edit,Write,Read,... # Blocked tools
+```
+
+See `.env.example` for a complete configuration template.
 
 ## Testing
 
@@ -221,6 +294,39 @@ The API includes proper error handling for:
 
 All errors follow the OpenAI error format for compatibility.
 
+## Docker Commands
+
+```bash
+# Build and run
+make build          # Build Docker image
+make run            # Run in default mode
+make run-dev        # Run in development mode
+make run-prod       # Run with Nginx proxy
+make run-redis      # Run with Redis sessions
+
+# Management
+make stop           # Stop all containers
+make clean          # Remove containers and volumes
+make logs           # View container logs
+make shell          # Open shell in container
+make health         # Check API health
+
+# Development
+make test           # Run tests
+make lint           # Run linting
+make format         # Format code with black
+```
+
+## Security Considerations
+
+By default, the API runs in **web-only mode** which:
+- ✅ Allows: WebSearch, WebFetch, WebView
+- ❌ Blocks: Bash, Edit, Write, Read, LS, Grep, Glob, etc.
+- ❌ Blocks: All file system access
+- ❌ Blocks: Command execution on host
+
+This ensures Claude cannot access or modify your host system.
+
 ## How It Works
 
-The API translates OpenAI-format requests into Claude CLI commands using subprocess. Messages are formatted and passed to the `claude` command, and the output is streamed back in OpenAI-compatible format.
+The API translates OpenAI-format requests into Claude CLI commands using subprocess. Messages are formatted and passed to the `claude` command with security restrictions, and the output is streamed back in OpenAI-compatible format.

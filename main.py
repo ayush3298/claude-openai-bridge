@@ -16,8 +16,28 @@ from io import BytesIO
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
+
+# Import models from our organized modules
+from claude_openai.models import (
+    # Chat models
+    Message,
+    ChatCompletionRequest,
+    Choice,
+    Usage,
+    ChatCompletionResponse,
+    StreamChoice,
+    ChatCompletionChunk,
+    # Response API models
+    ResponseRequest,
+    ResponseOutput,
+    ResponseUsageDetails,
+    ResponseUsage,
+    ResponseReasoning,
+    ResponseAPIResponse,
+    # Common models
+    StoredResponse,
+)
 
 # Optional imports with fallbacks
 try:
@@ -459,200 +479,7 @@ app = FastAPI(
 )
 
 
-class Message(BaseModel):
-    role: str
-    content: Optional[str] = None  # Can be None when using tools
-    name: Optional[str] = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
-    tool_call_id: Optional[str] = None
-    
-    @field_validator('content')
-    @classmethod
-    def validate_content(cls, content, info):
-        # Content can be None if tool_calls are present
-        # In Pydantic v2, we need to check the data differently
-        if content is None:
-            # Allow None content for now - tool_calls validation happens elsewhere
-            pass
-        return content
-
-
-class StoredResponse(BaseModel):
-    """Model for stored API responses"""
-    id: str  # response_id (e.g. "resp_abc123xyz")
-    conversation_id: Optional[str] = None  # Link to session
-    content: str  # The actual response content
-    model: str  # Model used
-    created: int  # Unix timestamp
-    tokens: Dict[str, int]  # Token usage info
-    finish_reason: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)  # Additional metadata
-    parent_response_id: Optional[str] = None  # Previous response in chain
-    messages: List[Dict[str, Any]] = Field(default_factory=list)  # Request messages that led to this response
-
-
-class ResponseRequest(BaseModel):
-    """Model for Response API requests"""
-    model: str
-    input: Optional[Union[str, List[Dict[str, Any]]]] = None
-    instructions: Optional[str] = None
-    max_output_tokens: Optional[int] = Field(default=None, gt=0)
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
-    top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
-    store: Optional[bool] = Field(default=True, description="Whether to store this response")
-    previous_response_id: Optional[str] = Field(default=None, description="ID of previous response to use for context")
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Any] = "auto"
-    parallel_tool_calls: Optional[bool] = True
-    text: Optional[Dict[str, Any]] = None  # Text formatting options
-    truncation: Optional[str] = "disabled"
-    user: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-
-
-class ResponseOutput(BaseModel):
-    """Model for response output content"""
-    type: str = "message"
-    id: str
-    status: str = "completed"
-    role: str = "assistant"
-    content: List[Dict[str, Any]]
-
-
-class ResponseUsageDetails(BaseModel):
-    """Model for detailed token usage"""
-    cached_tokens: int = 0
-    reasoning_tokens: int = 0
-
-
-class ResponseUsage(BaseModel):
-    """Model for response usage statistics"""
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
-    input_tokens_details: ResponseUsageDetails = Field(default_factory=ResponseUsageDetails)
-    output_tokens_details: ResponseUsageDetails = Field(default_factory=ResponseUsageDetails)
-
-
-class ResponseReasoning(BaseModel):
-    """Model for response reasoning details"""
-    effort: Optional[str] = None
-    summary: Optional[str] = None
-
-
-class ResponseAPIResponse(BaseModel):
-    """Model for Response API responses"""
-    id: str
-    object: str = "response"
-    created_at: int
-    status: str = "completed"
-    error: Optional[Any] = None
-    incomplete_details: Optional[Any] = None
-    instructions: Optional[str] = None
-    max_output_tokens: Optional[int] = None
-    model: str
-    output: List[ResponseOutput]
-    parallel_tool_calls: bool = True
-    previous_response_id: Optional[str] = None
-    reasoning: ResponseReasoning = Field(default_factory=ResponseReasoning)
-    store: bool = True
-    temperature: float = 1.0
-    text: Optional[Dict[str, Any]] = None
-    tool_choice: str = "auto"
-    tools: List[Any] = Field(default_factory=list)
-    top_p: float = 1.0
-    truncation: str = "disabled"
-    usage: ResponseUsage
-    user: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[Message]
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
-    top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
-    n: Optional[int] = Field(default=1, ge=1, le=10)  # Support up to 10 completions
-    stream: Optional[bool] = False
-    stop: Optional[List[str]] = None
-    max_tokens: Optional[int] = Field(default=None, gt=0)
-    presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
-    frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
-    user: Optional[str] = None
-    
-    # History management fields
-    session_id: Optional[str] = Field(default=None, description="Session ID for conversation history")
-    include_history: Optional[bool] = Field(default=True, description="Whether to include conversation history")
-    
-    # Responses API fields
-    store: Optional[bool] = Field(default=False, description="Whether to store this response for later retrieval")
-    previous_response_id: Optional[str] = Field(default=None, description="ID of previous response to use for context")
-    
-    # Additional OpenAI API fields
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Any] = None  # "auto", "none", or specific tool
-    response_format: Optional[Dict[str, str]] = None  # {"type": "json_object"}
-    seed: Optional[int] = None
-    logprobs: Optional[bool] = None
-    top_logprobs: Optional[int] = Field(default=None, ge=0, le=20)
-    logit_bias: Optional[Dict[str, float]] = None
-    suffix: Optional[str] = None
-    
-    @field_validator('messages')
-    @classmethod
-    def validate_messages(cls, messages):
-        if not messages:
-            raise ValueError('Messages list cannot be empty')
-        if len(messages) > 100:
-            raise ValueError('Too many messages (max 100)')
-        return messages
-    
-    @field_validator('model')
-    @classmethod
-    def validate_model(cls, model):
-        if not model or not model.strip():
-            raise ValueError('Model cannot be empty')
-        return model
-
-
-class Choice(BaseModel):
-    index: int
-    message: Message
-    finish_reason: str
-    logprobs: Optional[Any] = None
-
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[Choice]
-    usage: Usage
-    system_fingerprint: Optional[str] = None
-    response_id: Optional[str] = None  # For stored responses
-
-
-class StreamChoice(BaseModel):
-    index: int
-    delta: Dict[str, Any]
-    finish_reason: Optional[str] = None
-    logprobs: Optional[Any] = None
-
-
-class ChatCompletionChunk(BaseModel):
-    id: str
-    object: str = "chat.completion.chunk"
-    created: int
-    model: str
-    choices: List[StreamChoice]
-    system_fingerprint: Optional[str] = None
+# Models have been moved to claude_openai.models package
 
 
 def apply_stop_sequences(text: str, stop_sequences: Optional[List[str]]) -> tuple[str, str]:

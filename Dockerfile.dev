@@ -1,0 +1,34 @@
+# Development Dockerfile with hot reload support
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies including development tools
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only requirements for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install development dependencies
+RUN pip install --no-cache-dir \
+    watchdog \
+    ipython \
+    pytest \
+    black \
+    flake8
+
+# Create directories
+RUN mkdir -p /app/conversations
+
+# Don't copy source code - it will be mounted
+
+# Run as root in development for easier debugging
+EXPOSE 8000
+
+# Use watchdog for auto-reload in development
+CMD ["python", "-u", "main.py"]
