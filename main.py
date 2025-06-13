@@ -1033,7 +1033,9 @@ async def call_claude_subprocess(
                 
                 # Check for specific error types
                 error_text = stderr_text + stdout_content
-                if 'rate limit' in error_text.lower():
+                if 'usage limit reached' in error_text.lower() or 'usage limit' in error_text.lower():
+                    raise ClaudeRateLimitError(f"Claude usage limit reached. Please wait before making another request.")
+                elif 'rate limit' in error_text.lower():
                     raise ClaudeRateLimitError(f"Claude rate limit exceeded: {stderr_text}")
                 elif 'authentication' in error_text.lower() or 'auth' in error_text.lower():
                     raise ClaudeError(f"Claude authentication error: {stderr_text}")

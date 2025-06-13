@@ -1,4 +1,7 @@
+# Test files
 t.py
+test*.py
+quick_test.py
 
 # Python cache files
 __pycache__/
