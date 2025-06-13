@@ -63,6 +63,13 @@ class Config:
         self.history_ttl_hours = int(os.getenv("HISTORY_TTL_HOURS", 24))
         self.max_context_tokens = int(os.getenv("MAX_CONTEXT_TOKENS", 32000))
         
+        # Security configuration - restrict Claude to web-only tools
+        self.restricted_mode = os.getenv("RESTRICTED_MODE", "false").lower() == "true"
+        self.allowed_tools = os.getenv("ALLOWED_TOOLS", "WebSearch,WebFetch,WebView").split(",")
+        self.disallowed_tools = os.getenv("DISALLOWED_TOOLS", "Bash,Edit,Write,Read,LS,Grep,Glob,NotebookEdit,mcp__*").split(",")
+        self.dangerously_skip_permissions = os.getenv("DANGEROUSLY_SKIP_PERMISSIONS", "false").lower() == "true"
+        self.mcp_config = os.getenv("MCP_CONFIG", None)
+        
 config = Config()
 
 # Conversation History Management
@@ -908,9 +915,34 @@ async def call_claude_subprocess(
             if model:
                 cmd_args.extend(["--model", model])
             
+            # Add security restrictions if in restricted mode
+            if config.restricted_mode:
+                # Only allow specific tools
+                if config.allowed_tools:
+                    cmd_args.extend(["--allowedTools", ",".join(config.allowed_tools)])
+                # Explicitly disallow dangerous tools
+                if config.disallowed_tools:
+                    cmd_args.extend(["--disallowedTools", ",".join(config.disallowed_tools)])
+            else:
+                # In non-restricted mode, still apply some security by default
+                # This ensures file system access is blocked unless explicitly enabled
+                default_disallowed = ["Bash", "Edit", "Write", "Read", "LS", "Grep", "Glob", 
+                                    "NotebookEdit", "NotebookRead", "TodoWrite", "TodoRead", 
+                                    "exit_plan_mode", "Task", "MultiEdit", "mcp__*"]
+                cmd_args.extend(["--disallowedTools", ",".join(default_disallowed)])
+                # Only allow web tools by default
+                cmd_args.extend(["--allowedTools", "WebSearch,WebFetch,WebView"])
+            
+            # Add MCP config if provided
+            if config.mcp_config:
+                cmd_args.extend(["--mcp-config", config.mcp_config])
+            
+            # Skip permission checks if explicitly configured (use with caution!)
+            if config.dangerously_skip_permissions:
+                cmd_args.append("--dangerously-skip-permissions")
+            
             # Note: Claude CLI doesn't support temperature, max_tokens, or stop sequences
             # These will be handled via prompt engineering or post-processing
-            # Temperature and max_tokens are not supported by Claude CLI
             
             cmd_args.extend(["--print"])  # Use print mode for non-interactive output
             # Don't append prompt to cmd_args - we'll send it via stdin instead
@@ -1589,7 +1621,10 @@ async def root():
             "Multimodal input (images)",
             "Automatic retries",
             "Comprehensive error handling",
-            "File or memory-based persistence"
+            "File or memory-based persistence",
+            "Response API endpoint",
+            "Security restrictions (web-only mode)",
+            "Tool access control"
         ],
         "notes": {
             "tools": "Function calling is implemented via prompt engineering",
@@ -1597,6 +1632,29 @@ async def root():
             "logit_bias": "Not supported by Claude CLI",
             "presence_penalty": "Mapped to Claude temperature adjustments",
             "frequency_penalty": "Mapped to Claude temperature adjustments"
+        }
+    }
+
+@app.get("/v1/security")
+async def get_security_config():
+    """Get current security configuration"""
+    return {
+        "restricted_mode": config.restricted_mode,
+        "allowed_tools": config.allowed_tools,
+        "disallowed_tools": config.disallowed_tools,
+        "web_only_mode": set(config.allowed_tools) == {"WebSearch", "WebFetch", "WebView"},
+        "dangerously_skip_permissions": config.dangerously_skip_permissions,
+        "mcp_config": config.mcp_config is not None,
+        "description": {
+            "restricted_mode": "Whether Claude is running in restricted security mode",
+            "allowed_tools": "List of tools Claude is allowed to use",
+            "disallowed_tools": "List of tools Claude is explicitly forbidden from using",
+            "web_only_mode": "Whether Claude is restricted to web-only tools",
+            "recommendations": [
+                "For maximum security, use web-only mode with restricted_mode=true",
+                "File system tools (Bash, Edit, Write, Read, etc.) are disabled by default",
+                "MCP tools are restricted unless explicitly configured"
+            ]
         }
     }
 
@@ -1620,6 +1678,12 @@ async def health_check():
         "claude_cli": "available" if claude_available else "unavailable",
         "history_enabled": config.enable_history,
         "active_sessions": len(conversation_history.sessions),
+        "security": {
+            "restricted_mode": config.restricted_mode,
+            "allowed_tools": config.allowed_tools,
+            "disallowed_tools": config.disallowed_tools,
+            "web_only_mode": "WebSearch,WebFetch,WebView" in ",".join(config.allowed_tools)
+        },
         "timestamp": int(time.time())
     }
 
@@ -2023,6 +2087,9 @@ if __name__ == "__main__":
     logger.info(f"Request timeout: {config.request_timeout}s")
     logger.info(f"Max retries: {config.max_retries}")
     logger.info(f"Debug mode: {config.debug}")
+    logger.info(f"Security mode: {'Restricted' if config.restricted_mode else 'Default (Web-only)'}")
+    logger.info(f"Allowed tools: {', '.join(config.allowed_tools)}")
+    logger.info(f"Disallowed tools: {', '.join(config.disallowed_tools)}")
     
     uvicorn.run(
         app, 
