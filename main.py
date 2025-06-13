@@ -70,12 +70,15 @@ class ConversationHistory:
     def __init__(self):
         self.sessions = {}  # session_id -> conversation data
         self.session_access = defaultdict(lambda: datetime.now())  # Track last access
+        self.responses = {}  # response_id -> StoredResponse data
+        self.response_access = defaultdict(lambda: datetime.now())  # Track response access
         self.cleanup_interval = 3600  # Cleanup every hour
         self.last_cleanup = time.time()
         
         # Initialize storage directory if using file storage
         if config.history_storage == "file":
             Path(config.history_dir).mkdir(parents=True, exist_ok=True)
+            Path(config.history_dir + "/responses").mkdir(parents=True, exist_ok=True)
     
     def _generate_session_id(self, user_id: Optional[str] = None) -> str:
         """Generate a unique session ID"""
@@ -249,6 +252,172 @@ class ConversationHistory:
             sessions.append(self.get_session_info(session_id))
         
         return sorted(sessions, key=lambda x: x["last_activity"], reverse=True)
+    
+    # Response Management Methods
+    def _generate_response_id(self) -> str:
+        """Generate a unique response ID in OpenAI format"""
+        return f"resp_{uuid.uuid4().hex[:29]}"
+    
+    def store_response(
+        self, 
+        content: str, 
+        model: str, 
+        finish_reason: str,
+        tokens: Dict[str, int],
+        messages: List[Dict[str, Any]],
+        conversation_id: Optional[str] = None,
+        parent_response_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Store a response and return the response ID"""
+        response_id = self._generate_response_id()
+        
+        stored_response = StoredResponse(
+            id=response_id,
+            conversation_id=conversation_id,
+            content=content,
+            model=model,
+            created=int(time.time()),
+            tokens=tokens,
+            finish_reason=finish_reason,
+            metadata=metadata or {},
+            parent_response_id=parent_response_id,
+            messages=messages
+        )
+        
+        # Store in memory
+        self.responses[response_id] = stored_response.model_dump()
+        self.response_access[response_id] = datetime.now()
+        
+        # Store in file if file storage is enabled
+        self._save_response_to_file(response_id, stored_response.model_dump())
+        
+        logger.info(f"Stored response {response_id}")
+        return response_id
+    
+    def get_response(self, response_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a stored response by ID"""
+        # Clean up expired responses first
+        self._cleanup_expired_responses()
+        
+        # Try to get from memory first
+        if response_id in self.responses:
+            self.response_access[response_id] = datetime.now()
+            return self.responses[response_id]
+        
+        # Try to load from file storage
+        response_data = self._load_response_from_file(response_id)
+        if response_data:
+            self.responses[response_id] = response_data
+            self.response_access[response_id] = datetime.now()
+            return response_data
+        
+        return None
+    
+    def get_response_context_chain(self, response_id: str) -> List[Dict[str, Any]]:
+        """Get the full conversation context chain leading up to a response"""
+        context_messages = []
+        current_response_id = response_id
+        
+        # Traverse the response chain backwards to build context
+        visited = set()  # Prevent infinite loops
+        while current_response_id and current_response_id not in visited:
+            visited.add(current_response_id)
+            response_data = self.get_response(current_response_id)
+            
+            if not response_data:
+                break
+                
+            # Add the messages that led to this response
+            if response_data.get("messages"):
+                context_messages = response_data["messages"] + context_messages
+            
+            # Add the response itself as an assistant message
+            context_messages.append({
+                "role": "assistant",
+                "content": response_data["content"]
+            })
+            
+            # Move to parent response
+            current_response_id = response_data.get("parent_response_id")
+        
+        return context_messages
+    
+    def _save_response_to_file(self, response_id: str, response_data: Dict):
+        """Save response to file storage"""
+        if config.history_storage != "file":
+            return
+            
+        response_file = Path(config.history_dir) / "responses" / f"{response_id}.json"
+        try:
+            with open(response_file, 'w', encoding='utf-8') as f:
+                json.dump(response_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save response {response_id}: {e}")
+    
+    def _load_response_from_file(self, response_id: str) -> Optional[Dict]:
+        """Load response from file storage"""
+        if config.history_storage != "file":
+            return None
+            
+        response_file = Path(config.history_dir) / "responses" / f"{response_id}.json"
+        if not response_file.exists():
+            return None
+            
+        try:
+            with open(response_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load response {response_id}: {e}")
+            return None
+    
+    def _cleanup_expired_responses(self):
+        """Remove expired responses"""
+        if time.time() - self.last_cleanup < self.cleanup_interval:
+            return
+            
+        cutoff_time = datetime.now() - timedelta(hours=config.history_ttl_hours)
+        expired_responses = [
+            response_id for response_id, last_access in self.response_access.items()
+            if last_access < cutoff_time
+        ]
+        
+        for response_id in expired_responses:
+            self._delete_response(response_id)
+            
+        if expired_responses:
+            logger.info(f"Cleaned up {len(expired_responses)} expired responses")
+    
+    def _delete_response(self, response_id: str):
+        """Delete a response from all storage"""
+        # Remove from memory
+        self.responses.pop(response_id, None)
+        self.response_access.pop(response_id, None)
+        
+        # Remove from file storage if applicable
+        if config.history_storage == "file":
+            response_file = Path(config.history_dir) / "responses" / f"{response_id}.json"
+            if response_file.exists():
+                response_file.unlink()
+    
+    def list_responses(self, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List stored responses, optionally filtered by conversation_id"""
+        responses = []
+        for response_id, response_data in self.responses.items():
+            if conversation_id and response_data.get("conversation_id") != conversation_id:
+                continue
+                
+            responses.append({
+                "id": response_id,
+                "conversation_id": response_data.get("conversation_id"),
+                "model": response_data.get("model"),
+                "created": response_data.get("created"),
+                "tokens": response_data.get("tokens"),
+                "finish_reason": response_data.get("finish_reason"),
+                "parent_response_id": response_data.get("parent_response_id")
+            })
+        
+        return sorted(responses, key=lambda x: x["created"], reverse=True)
 
 # Global conversation history manager
 conversation_history = ConversationHistory()
@@ -301,6 +470,96 @@ class Message(BaseModel):
         return content
 
 
+class StoredResponse(BaseModel):
+    """Model for stored API responses"""
+    id: str  # response_id (e.g. "resp_abc123xyz")
+    conversation_id: Optional[str] = None  # Link to session
+    content: str  # The actual response content
+    model: str  # Model used
+    created: int  # Unix timestamp
+    tokens: Dict[str, int]  # Token usage info
+    finish_reason: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)  # Additional metadata
+    parent_response_id: Optional[str] = None  # Previous response in chain
+    messages: List[Dict[str, Any]] = Field(default_factory=list)  # Request messages that led to this response
+
+
+class ResponseRequest(BaseModel):
+    """Model for Response API requests"""
+    model: str
+    input: Optional[Union[str, List[Dict[str, Any]]]] = None
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = Field(default=None, gt=0)
+    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
+    top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
+    store: Optional[bool] = Field(default=True, description="Whether to store this response")
+    previous_response_id: Optional[str] = Field(default=None, description="ID of previous response to use for context")
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = "auto"
+    parallel_tool_calls: Optional[bool] = True
+    text: Optional[Dict[str, Any]] = None  # Text formatting options
+    truncation: Optional[str] = "disabled"
+    user: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ResponseOutput(BaseModel):
+    """Model for response output content"""
+    type: str = "message"
+    id: str
+    status: str = "completed"
+    role: str = "assistant"
+    content: List[Dict[str, Any]]
+
+
+class ResponseUsageDetails(BaseModel):
+    """Model for detailed token usage"""
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
+
+
+class ResponseUsage(BaseModel):
+    """Model for response usage statistics"""
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    input_tokens_details: ResponseUsageDetails = Field(default_factory=ResponseUsageDetails)
+    output_tokens_details: ResponseUsageDetails = Field(default_factory=ResponseUsageDetails)
+
+
+class ResponseReasoning(BaseModel):
+    """Model for response reasoning details"""
+    effort: Optional[str] = None
+    summary: Optional[str] = None
+
+
+class ResponseAPIResponse(BaseModel):
+    """Model for Response API responses"""
+    id: str
+    object: str = "response"
+    created_at: int
+    status: str = "completed"
+    error: Optional[Any] = None
+    incomplete_details: Optional[Any] = None
+    instructions: Optional[str] = None
+    max_output_tokens: Optional[int] = None
+    model: str
+    output: List[ResponseOutput]
+    parallel_tool_calls: bool = True
+    previous_response_id: Optional[str] = None
+    reasoning: ResponseReasoning = Field(default_factory=ResponseReasoning)
+    store: bool = True
+    temperature: float = 1.0
+    text: Optional[Dict[str, Any]] = None
+    tool_choice: str = "auto"
+    tools: List[Any] = Field(default_factory=list)
+    top_p: float = 1.0
+    truncation: str = "disabled"
+    usage: ResponseUsage
+    user: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Message]
@@ -317,6 +576,10 @@ class ChatCompletionRequest(BaseModel):
     # History management fields
     session_id: Optional[str] = Field(default=None, description="Session ID for conversation history")
     include_history: Optional[bool] = Field(default=True, description="Whether to include conversation history")
+    
+    # Responses API fields
+    store: Optional[bool] = Field(default=False, description="Whether to store this response for later retrieval")
+    previous_response_id: Optional[str] = Field(default=None, description="ID of previous response to use for context")
     
     # Additional OpenAI API fields
     tools: Optional[List[Dict[str, Any]]] = None
@@ -366,6 +629,7 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Choice]
     usage: Usage
     system_fingerprint: Optional[str] = None
+    response_id: Optional[str] = None  # For stored responses
 
 
 class StreamChoice(BaseModel):
@@ -594,25 +858,26 @@ def map_openai_model_to_claude(model: str) -> str:
     else:
         model_mapping = {}
     
-    # Default mappings
+    # Default mappings - use model aliases that work with Claude CLI
     default_mappings = {
-        "gpt-4": "claude-3-5-sonnet-20241022",
-        "gpt-4-turbo": "claude-3-5-sonnet-20241022",
-        "gpt-4-turbo-preview": "claude-3-5-sonnet-20241022",
-        "gpt-4o": "claude-3-5-sonnet-20241022",
-        "gpt-4o-mini": "claude-3-5-haiku-20241022",
-        "gpt-3.5-turbo": "claude-3-5-haiku-20241022",
-        "gpt-3.5-turbo-16k": "claude-3-5-haiku-20241022",
-        # Direct Claude model support
-        "claude-3-5-sonnet-20241022": "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022": "claude-3-5-haiku-20241022",
-        "claude-3-opus-20240229": "claude-3-opus-20240229",
+        "gpt-4": "sonnet",
+        "gpt-4-turbo": "sonnet",
+        "gpt-4-turbo-preview": "sonnet",
+        "gpt-4o": "sonnet",
+        "gpt-4.1": "sonnet",
+        "gpt-4o-mini": "haiku",
+        "gpt-3.5-turbo": "haiku",
+        "gpt-3.5-turbo-16k": "haiku",
+        # Direct Claude model support - use aliases
+        "claude-3-5-sonnet-20241022": "sonnet",
+        "claude-3-5-haiku-20241022": "haiku",
+        "claude-3-opus-20240229": "opus",
     }
     
     # Merge with custom mappings taking precedence
     final_mappings = {**default_mappings, **model_mapping}
     
-    mapped_model = final_mappings.get(model, "claude-3-5-sonnet-20241022")
+    mapped_model = final_mappings.get(model, "sonnet")
     if mapped_model != model:
         logger.info(f"Mapped model {model} to {mapped_model}")
     
@@ -648,15 +913,28 @@ async def call_claude_subprocess(
             # Temperature and max_tokens are not supported by Claude CLI
             
             cmd_args.extend(["--print"])  # Use print mode for non-interactive output
-            cmd_args.append(prompt)
+            # Don't append prompt to cmd_args - we'll send it via stdin instead
             
             # Create the subprocess with timeout
             process = await asyncio.create_subprocess_exec(
                 *cmd_args,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=1024*1024  # 1MB buffer limit
             )
+            
+            # Send the prompt via stdin and close it
+            try:
+                process.stdin.write(prompt.encode('utf-8'))
+                await process.stdin.drain()
+                process.stdin.close()
+                await process.stdin.wait_closed()
+            except Exception as e:
+                logger.error(f"Failed to send prompt via stdin: {e}")
+                if process:
+                    process.terminate()
+                raise ClaudeProcessError(f"Failed to send prompt to Claude: {e}")
             
             # Read output with timeout
             output_lines = []
@@ -714,14 +992,21 @@ async def call_claude_subprocess(
                     pass
                 
                 stderr_text = stderr_data.decode('utf-8', errors='replace')
+                stdout_content = ''.join(output_lines) if output_lines else ''
+                
+                logger.error(f"Claude command failed. Command: {' '.join(cmd_args)}")
+                logger.error(f"Exit code: {process.returncode}")
+                logger.error(f"Stderr: {repr(stderr_text)}")
+                logger.error(f"Stdout: {repr(stdout_content[:500])}")  # First 500 chars
                 
                 # Check for specific error types
-                if 'rate limit' in stderr_text.lower():
+                error_text = stderr_text + stdout_content
+                if 'rate limit' in error_text.lower():
                     raise ClaudeRateLimitError(f"Claude rate limit exceeded: {stderr_text}")
-                elif 'authentication' in stderr_text.lower() or 'auth' in stderr_text.lower():
+                elif 'authentication' in error_text.lower() or 'auth' in error_text.lower():
                     raise ClaudeError(f"Claude authentication error: {stderr_text}")
                 else:
-                    raise ClaudeProcessError(f"Claude command failed with code {process.returncode}: {stderr_text}")
+                    raise ClaudeProcessError(f"Claude command failed with code {process.returncode}. Stderr: {stderr_text}. Stdout: {stdout_content[:200]}")
             
             # Success, no need to retry
             logger.debug(f"Claude subprocess completed successfully on attempt {attempt}")
@@ -971,11 +1256,20 @@ async def create_chat_completion(
             session_id = conversation_history.get_or_create_session(session_id, request.user)
             logger.info(f"Request {request_id}: Using session {session_id}")
         
-        # Get conversation context if history is enabled
+        # Get conversation context - prioritize previous_response_id over session history
         conversation_context = []
-        if config.enable_history and request.include_history and session_id:
+        parent_response_id = None
+        
+        if config.enable_history and request.previous_response_id:
+            # Use previous response chain for context
+            conversation_context = conversation_history.get_response_context_chain(request.previous_response_id)
+            parent_response_id = request.previous_response_id
+            logger.info(f"Request {request_id}: Using previous response context from {request.previous_response_id}")
+            logger.debug(f"Request {request_id}: Retrieved {len(conversation_context)} context messages from response chain")
+        elif config.enable_history and request.include_history and session_id:
+            # Use session history for context
             conversation_context = conversation_history.get_conversation_context(session_id)
-            logger.debug(f"Request {request_id}: Retrieved {len(conversation_context)} context messages")
+            logger.debug(f"Request {request_id}: Retrieved {len(conversation_context)} context messages from session")
         
         # Add current user messages to history before processing
         if config.enable_history and session_id:
@@ -1109,9 +1403,53 @@ async def create_chat_completion(
             )
         )
         
-        # Add session ID to response headers if available
+        # Store response if requested
+        response_id = None
+        if config.enable_history and request.store and choices:
+            # Store the first choice's response (primary response)
+            first_choice = choices[0]
+            response_content = first_choice.message.content or ""
+            
+            # Convert request messages to dict format for storage
+            request_messages = [
+                {
+                    "role": msg.role,
+                    "content": msg.content,
+                    "name": msg.name
+                }
+                for msg in request.messages
+            ]
+            
+            response_id = conversation_history.store_response(
+                content=response_content,
+                model=mapped_model,
+                finish_reason=first_choice.finish_reason,
+                tokens={
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": total_prompt_tokens + total_completion_tokens
+                },
+                messages=request_messages,
+                conversation_id=session_id,
+                parent_response_id=parent_response_id,
+                metadata={
+                    "request_id": request_id,
+                    "temperature": request.temperature,
+                    "max_tokens": request.max_tokens,
+                    "n": request.n,
+                    "tools": request.tools is not None,
+                    "response_format": request.response_format
+                }
+            )
+            logger.info(f"Request {request_id}: Stored response as {response_id}")
+        
+        # Add session ID and response ID to response headers if available
         if session_id:
             completion_response.system_fingerprint = session_id
+        
+        # Add response_id to the response if stored
+        if response_id:
+            completion_response.response_id = response_id
         
         logger.info(f"Request {request_id}: Completed successfully")
         return completion_response
@@ -1213,6 +1551,12 @@ async def list_models():
             "object": "model",
             "created": 1709251200,
             "owned_by": "anthropic"
+        },
+        {
+            "id": "gpt-4.1",
+            "object": "model",
+            "created": 1740000000,
+            "owned_by": "openai"
         }
     ]
     
@@ -1228,6 +1572,7 @@ async def root():
         "version": "1.1.0",
         "endpoints": {
             "chat_completions": "/v1/chat/completions",
+            "responses": "/v1/responses",
             "models": "/v1/models",
             "health": "/health"
         },
@@ -1360,6 +1705,283 @@ async def clear_session_history(session_id: str):
     
     logger.info(f"Cleared history for session: {session_id}")
     return {"message": "Session history cleared successfully"}
+
+
+def _format_input_as_messages(input_data: Optional[Union[str, List[Dict[str, Any]]]]) -> List[Dict[str, Any]]:
+    """Convert input data to messages format for storage"""
+    if not input_data:
+        return []
+    
+    if isinstance(input_data, str):
+        return [{"role": "user", "content": input_data}]
+    elif isinstance(input_data, list):
+        return input_data
+    else:
+        return [{"role": "user", "content": str(input_data)}]
+
+
+# Response Management Endpoints
+@app.post("/v1/responses")
+async def create_response(request: ResponseRequest):
+    """Create a new response using the Response API format"""
+    request_id = f"resp-{uuid.uuid4().hex[:12]}"
+    logger.info(f"Received response request {request_id} for model {request.model}")
+    
+    try:
+        # Get conversation context if previous_response_id is provided
+        conversation_context = []
+        if config.enable_history and request.previous_response_id:
+            conversation_context = conversation_history.get_response_context_chain(request.previous_response_id)
+            logger.info(f"Request {request_id}: Using previous response context from {request.previous_response_id}")
+            logger.debug(f"Request {request_id}: Retrieved {len(conversation_context)} context messages from response chain")
+        
+        # Build the prompt from input and instructions
+        prompt_parts = []
+        if request.instructions:
+            prompt_parts.append(f"System: {request.instructions}")
+        
+        # Handle both string and list inputs
+        if request.input:
+            if isinstance(request.input, str):
+                prompt_parts.append(f"Human: {request.input}")
+            elif isinstance(request.input, list):
+                # Handle list of messages (like chat format)
+                for msg in request.input:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        prompt_parts.append(f"Human: {content}")
+                    elif role == "assistant":
+                        prompt_parts.append(f"Assistant: {content}")
+                    elif role == "system":
+                        prompt_parts.append(f"System: {content}")
+            else:
+                # Convert to string as fallback
+                prompt_parts.append(f"Human: {str(request.input)}")
+        
+        # Add conversation context if available
+        if conversation_context:
+            logger.debug(f"Including {len(conversation_context)} messages from conversation history")
+            for msg in conversation_context:
+                content = str(msg.get("content", "")).strip()
+                if not content:
+                    continue
+                role = msg.get("role", "user")
+                if role == "system":
+                    prompt_parts.insert(-1 if request.input else -1, f"System: {content}")
+                elif role == "user":
+                    prompt_parts.insert(-1 if request.input else -1, f"Human: {content}")
+                elif role == "assistant":
+                    prompt_parts.insert(-1 if request.input else -1, f"Assistant: {content}")
+        
+        prompt_parts.append("Assistant:")
+        prompt = "\n\n".join(prompt_parts)
+        
+        mapped_model = map_openai_model_to_claude(request.model)
+        logger.debug(f"Request {request_id}: prompt length = {len(prompt)} chars")
+        
+        # Generate response using Claude
+        full_response = ""
+        start_time = time.time()
+        
+        async for chunk in call_claude_subprocess(
+            prompt, 
+            mapped_model, 
+            config.request_timeout,
+            temperature=request.temperature,
+            max_tokens=request.max_output_tokens
+        ):
+            full_response += chunk
+        
+        response_time = time.time() - start_time
+        logger.info(f"Request {request_id}: Claude response received in {response_time:.2f}s")
+        
+        # Calculate tokens
+        input_tokens = estimate_tokens(prompt)
+        output_tokens = estimate_tokens(full_response)
+        total_tokens = input_tokens + output_tokens
+        
+        # Generate response ID
+        response_id = conversation_history._generate_response_id()
+        
+        # Create the response content in the expected format
+        output_message_id = f"msg_{uuid.uuid4().hex[:29]}"
+        
+        response_output = ResponseOutput(
+            type="message",
+            id=output_message_id,
+            status="completed",
+            role="assistant",
+            content=[{
+                "type": "output_text",
+                "text": full_response.strip(),
+                "annotations": []
+            }]
+        )
+        
+        response_usage = ResponseUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            input_tokens_details=ResponseUsageDetails(cached_tokens=0),
+            output_tokens_details=ResponseUsageDetails(reasoning_tokens=0)
+        )
+        
+        # Store response if requested
+        if config.enable_history and request.store:
+            stored_response_id = conversation_history.store_response(
+                content=full_response.strip(),
+                model=mapped_model,
+                finish_reason="stop",
+                tokens={
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                },
+                messages=_format_input_as_messages(request.input),
+                conversation_id=None,
+                parent_response_id=request.previous_response_id,
+                metadata={
+                    "request_id": request_id,
+                    "temperature": request.temperature,
+                    "max_output_tokens": request.max_output_tokens,
+                    "instructions": request.instructions,
+                    "api_type": "responses"
+                }
+            )
+            logger.info(f"Request {request_id}: Stored response as {stored_response_id}")
+        
+        # Create the response in the expected format
+        api_response = ResponseAPIResponse(
+            id=response_id,
+            object="response",
+            created_at=int(time.time()),
+            status="completed",
+            error=None,
+            incomplete_details=None,
+            instructions=request.instructions,
+            max_output_tokens=request.max_output_tokens,
+            model=request.model,
+            output=[response_output],
+            parallel_tool_calls=request.parallel_tool_calls or True,
+            previous_response_id=request.previous_response_id,
+            reasoning=ResponseReasoning(effort=None, summary=None),
+            store=request.store or True,
+            temperature=request.temperature or 1.0,
+            text=request.text,
+            tool_choice=str(request.tool_choice) if request.tool_choice else "auto",
+            tools=request.tools or [],
+            top_p=request.top_p or 1.0,
+            truncation=request.truncation or "disabled",
+            usage=response_usage,
+            user=request.user,
+            metadata=request.metadata or {}
+        )
+        
+        logger.info(f"Request {request_id}: Completed successfully")
+        return api_response
+        
+    except ClaudeNotFoundError as e:
+        logger.error(f"Request {request_id}: Claude not found - {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Claude CLI not found. Please install and configure Claude CLI."
+        )
+        
+    except ClaudeTimeoutError as e:
+        logger.error(f"Request {request_id}: Timeout - {e}")
+        raise HTTPException(
+            status_code=408,
+            detail="Request timed out. Please try again with a shorter prompt."
+        )
+        
+    except ClaudeRateLimitError as e:
+        logger.error(f"Request {request_id}: Rate limit - {e}")
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Please wait before making another request."
+        )
+        
+    except ValueError as e:
+        logger.error(f"Request {request_id}: Validation error - {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+        
+    except Exception as e:
+        logger.error(f"Request {request_id}: Unexpected error - {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred. Please try again."
+        )
+
+
+@app.get("/v1/responses/{response_id}")
+async def get_response(response_id: str):
+    """Retrieve a stored response by ID"""
+    if not config.enable_history:
+        raise HTTPException(status_code=503, detail="Response storage is disabled")
+    
+    response_data = conversation_history.get_response(response_id)
+    if not response_data:
+        raise HTTPException(status_code=404, detail="Response not found")
+    
+    # Format response to match OpenAI's format
+    return {
+        "id": response_data["id"],
+        "object": "response",
+        "created": response_data["created"],
+        "model": response_data["model"],
+        "content": response_data["content"],
+        "tokens": response_data["tokens"],
+        "finish_reason": response_data["finish_reason"],
+        "conversation_id": response_data.get("conversation_id"),
+        "parent_response_id": response_data.get("parent_response_id"),
+        "metadata": response_data.get("metadata", {})
+    }
+
+@app.get("/v1/responses")
+async def list_responses(conversation_id: Optional[str] = None):
+    """List stored responses, optionally filtered by conversation_id"""
+    if not config.enable_history:
+        raise HTTPException(status_code=503, detail="Response storage is disabled")
+    
+    responses = conversation_history.list_responses(conversation_id)
+    return {
+        "object": "list",
+        "data": responses,
+        "total": len(responses)
+    }
+
+@app.delete("/v1/responses/{response_id}")
+async def delete_response(response_id: str):
+    """Delete a stored response"""
+    if not config.enable_history:
+        raise HTTPException(status_code=503, detail="Response storage is disabled")
+    
+    response_data = conversation_history.get_response(response_id)
+    if not response_data:
+        raise HTTPException(status_code=404, detail="Response not found")
+    
+    conversation_history._delete_response(response_id)
+    logger.info(f"Deleted response: {response_id}")
+    
+    return {"message": "Response deleted successfully"}
+
+@app.get("/v1/responses/{response_id}/context")
+async def get_response_context(response_id: str):
+    """Get the full conversation context chain for a response"""
+    if not config.enable_history:
+        raise HTTPException(status_code=503, detail="Response storage is disabled")
+    
+    response_data = conversation_history.get_response(response_id)
+    if not response_data:
+        raise HTTPException(status_code=404, detail="Response not found")
+    
+    context_chain = conversation_history.get_response_context_chain(response_id)
+    return {
+        "response_id": response_id,
+        "context_chain": context_chain,
+        "total_messages": len(context_chain)
+    }
 
 
 def parse_args():
